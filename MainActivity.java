@@ -2,11 +2,11 @@ package com.dxmaster.vpnmic;
 
 import android.Manifest;
 import android.app.Activity;
-import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Message;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -22,16 +22,18 @@ import android.widget.TextView;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
 
 public class MainActivity extends Activity {
 
     private static final String FB_URL = "https://www.facebook.com/";
     private static final String MSG_URL = "https://www.facebook.com/messages/";
-    // Desktop user agent: Messenger calls work on the desktop web version
     private static final String UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             + "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
     private WebView web;
+    private FrameLayout rootLayout;
+    private final ArrayList<WebView> popups = new ArrayList<>();
     private String boosterJs = "";
     private boolean redirected = false;
 
@@ -43,6 +45,7 @@ public class MainActivity extends Activity {
         boosterJs = readAsset("dx_booster.js");
 
         FrameLayout root = new FrameLayout(this);
+        rootLayout = root;
         root.setBackgroundColor(Color.parseColor("#0A0A1A"));
 
         LinearLayout col = new LinearLayout(this);
@@ -63,14 +66,14 @@ public class MainActivity extends Activity {
         splash.postDelayed(() -> splash.animate().alpha(0f).setDuration(500)
                 .withEndAction(() -> splash.setVisibility(View.GONE)).start(), 1800);
 
-        setupWeb();
+        configure(web, false);
         requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO,
                 Manifest.permission.CAMERA}, 1);
         web.loadUrl(FB_URL);
     }
 
-    private void setupWeb() {
-        WebSettings s = web.getSettings();
+    private void configure(final WebView w, final boolean isPopup) {
+        WebSettings s = w.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setMediaPlaybackRequiresUserGesture(false);
@@ -80,20 +83,43 @@ public class MainActivity extends Activity {
         s.setSupportZoom(true);
         s.setBuiltInZoomControls(true);
         s.setDisplayZoomControls(false);
+        s.setSupportMultipleWindows(true);
+        s.setJavaScriptCanOpenWindowsAutomatically(true);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
 
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);
-        cm.setAcceptThirdPartyCookies(web, true);
+        cm.setAcceptThirdPartyCookies(w, true);
 
-        web.setWebChromeClient(new WebChromeClient() {
+        w.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onPermissionRequest(final PermissionRequest request) {
                 runOnUiThread(() -> request.grant(request.getResources()));
             }
+
+            @Override
+            public boolean onCreateWindow(WebView view, boolean isDialog,
+                                          boolean isUserGesture, Message resultMsg) {
+                WebView popup = new WebView(MainActivity.this);
+                configure(popup, true);
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+                lp.topMargin = dp(52);
+                rootLayout.addView(popup, lp);
+                popups.add(popup);
+                WebView.WebViewTransport t = (WebView.WebViewTransport) resultMsg.obj;
+                t.setWebView(popup);
+                resultMsg.sendToTarget();
+                return true;
+            }
+
+            @Override
+            public void onCloseWindow(WebView window) {
+                closePopup(window);
+            }
         });
 
-        web.setWebViewClient(new WebViewClient() {
+        w.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageStarted(WebView v, String url, android.graphics.Bitmap f) {
                 v.evaluateJavascript(boosterJs, null);
@@ -103,7 +129,7 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView v, String url) {
                 v.evaluateJavascript(boosterJs, null);
                 CookieManager.getInstance().flush();
-                // Facebook logged in -> go to Messenger automatically
+                if (isPopup) return;
                 String c = CookieManager.getInstance().getCookie("https://www.facebook.com");
                 if (!redirected && url != null && url.contains("facebook.com")
                         && !url.contains("/messages") && c != null && c.contains("c_user=")) {
@@ -112,6 +138,12 @@ public class MainActivity extends Activity {
                 }
             }
         });
+    }
+
+    private void closePopup(WebView p) {
+        popups.remove(p);
+        rootLayout.removeView(p);
+        p.destroy();
     }
 
     private View buildBar() {
@@ -136,7 +168,9 @@ public class MainActivity extends Activity {
 
         bar.addView(barBtn("Facebook", v -> { redirected = false; web.loadUrl(FB_URL); }));
         bar.addView(barBtn("Messenger", v -> web.loadUrl(MSG_URL)));
-        bar.addView(barBtn("⟳", v -> web.reload()));
+        bar.addView(barBtn("⟳", v -> {
+            if (!popups.isEmpty()) popups.get(popups.size() - 1).reload(); else web.reload();
+        }));
         return bar;
     }
 
@@ -204,6 +238,12 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (web.canGoBack()) web.goBack(); else super.onBackPressed();
+        if (!popups.isEmpty()) {
+            closePopup(popups.get(popups.size() - 1));
+        } else if (web.canGoBack()) {
+            web.goBack();
+        } else {
+            super.onBackPressed();
+        }
     }
 }
