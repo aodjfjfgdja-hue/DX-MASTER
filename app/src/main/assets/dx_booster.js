@@ -1,16 +1,27 @@
 (function () {
   if (window.__dxLoaded) return; window.__dxLoaded = true;
-  var KEY = 'dx_gain_v1';
+  var KEY = 'dx_gain_v2';
   var state = { gain: 300, on: true };
   try { var sv = JSON.parse(localStorage.getItem(KEY)); if (sv) state = sv; } catch (e) {}
   var nodes = window.__dxNodes = window.__dxNodes || [];
+  var inNodes = window.__dxInNodes = window.__dxInNodes || [];
 
   function apply() {
     var g = state.on ? state.gain / 100 : 1;
+    // incoming (others' voice): extra gain on top of the normal playback, capped at 4x total
+    var gi = state.on ? Math.max(0, Math.min(state.gain / 100, 4) - 1) : 0;
     nodes.forEach(function (n) { try { n.gain.value = g; } catch (e) {} });
+    inNodes.forEach(function (n) { try { n.gain.value = gi; } catch (e) {} });
     try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {}
   }
   window.__dxApply = apply;
+
+  function makeLimiter(ctx) {
+    var lim = ctx.createDynamicsCompressor();
+    lim.threshold.value = -2; lim.knee.value = 0; lim.ratio.value = 20;
+    lim.attack.value = 0.001; lim.release.value = 0.08;
+    return lim;
+  }
 
   // ---- 1) Boost the outgoing mic so EVERYONE in the call hears it ----
   if (!window.__dxHooked && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
@@ -25,9 +36,7 @@
         if (ctx.state === 'suspended') await ctx.resume();
         var src = ctx.createMediaStreamSource(new MediaStream(s.getAudioTracks()));
         var g = ctx.createGain();
-        var lim = ctx.createDynamicsCompressor();
-        lim.threshold.value = -12; lim.knee.value = 6; lim.ratio.value = 20;
-        lim.attack.value = 0.003; lim.release.value = 0.1;
+        var lim = makeLimiter(ctx);
         var dest = ctx.createMediaStreamDestination();
         src.connect(g); g.connect(lim); lim.connect(dest);
         nodes.push(g);
@@ -40,7 +49,37 @@
     };
   }
 
-  // ---- 2) Side control panel ----
+  // ---- 2) Boost incoming call audio (other people's voices) ----
+  function boostIn(track) {
+    try {
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      var ctx = new Ctx();
+      if (ctx.state === 'suspended') ctx.resume();
+      var src = ctx.createMediaStreamSource(new MediaStream([track]));
+      var g = ctx.createGain();
+      var lim = makeLimiter(ctx);
+      src.connect(g); g.connect(lim); lim.connect(ctx.destination);
+      inNodes.push(g);
+      apply();
+    } catch (e) {}
+  }
+  var PC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+  if (PC && !window.__dxPC) {
+    window.__dxPC = true;
+    var NewPC = function (a, b) {
+      var pc = new PC(a, b);
+      pc.addEventListener('track', function (e) {
+        if (e.track && e.track.kind === 'audio') boostIn(e.track);
+      });
+      return pc;
+    };
+    NewPC.prototype = PC.prototype;
+    try { Object.setPrototypeOf(NewPC, PC); } catch (e) {}
+    window.RTCPeerConnection = NewPC;
+    if (window.webkitRTCPeerConnection) window.webkitRTCPeerConnection = NewPC;
+  }
+
+  // ---- 3) Side control panel ----
   function build() {
     if (document.getElementById('dx-panel') || !document.body) return;
     var st = document.createElement('style');
@@ -102,5 +141,5 @@
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', build);
   else build();
-  setInterval(build, 3000); // rebuild if the page re-renders and removes the panel
+  setInterval(build, 3000);
 })();
