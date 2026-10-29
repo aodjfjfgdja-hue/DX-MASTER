@@ -1,7 +1,7 @@
 (function () {
   if (window.__dxLoaded) return; window.__dxLoaded = true;
-  var KEY = 'dx_cfg_v6';
-  var st = { voice: 10000, echo: 1500, cut: 6, on: true, bass: true, eon: true, mode: 'lord' };
+  var KEY = 'dx_cfg_v7';
+  var st = { voice: 300000, echo: 20000, echoTime: 500, bassDb: 20, cut: 6, on: true, bass: true, eon: true, mode: 'lord' };
   try { var sv = JSON.parse(localStorage.getItem(KEY)); if (sv) { for (var k in sv) st[k] = sv[k]; } } catch (e) {}
 
   var pipes = [], ctxs = [], pcs = new Set();
@@ -33,14 +33,14 @@
     var L = st.mode === 'lord';
     var c = L
       ? { thr: -60, knee: 40, ratio: 20, att: 0.0001, rel: 0.03, loud: 10, drive: 1.8,
-          low: 14, pres: 20, high: 16, limit: -0.1, sT: -2, sMax: 64 }
+          pres: 20, high: 16, limit: -0.1, sT: -2, sMax: 64, bassMul: 1 }
       : { thr: -38, knee: 30, ratio: 12, att: 0.002, rel: 0.1, loud: 3, drive: 0.28,
-          low: 4, pres: 8, high: 6, limit: -2, sT: -8, sMax: 12 };
+          pres: 8, high: 6, limit: -2, sT: -8, sMax: 12, bassMul: 0.5 };
+    c.low = (st.on && st.bass) ? st.bassDb * c.bassMul : 0;
+    c.sub = c.low * 0.6;
     if (!st.on) {
       c.thr = -6; c.knee = 0; c.ratio = 1; c.loud = 1; c.drive = 0;
-      c.low = 0; c.pres = 0; c.high = 0; c.limit = -0.5; c.sMax = 1;
-    } else if (!st.bass) {
-      c.low = 0;
+      c.pres = 0; c.high = 0; c.limit = -0.5; c.sMax = 1;
     }
     return c;
   }
@@ -61,16 +61,24 @@
 
   function applyOne(p) {
     var c = params(), n = p.nodes;
-    setP(n.low.gain, c.low); setP(n.pres.gain, c.pres); setP(n.high.gain, c.high);
+    setP(n.low.gain, c.low); setP(n.sub.gain, c.sub);
+    setP(n.pres.gain, c.pres); setP(n.high.gain, c.high);
     setP(n.comp1.threshold, c.thr); setP(n.comp1.knee, c.knee); setP(n.comp1.ratio, c.ratio);
     setP(n.comp1.attack, c.att); setP(n.comp1.release, c.rel);
     setP(n.loud.gain, c.loud);
     setP(n.gain.gain, st.on ? clamp(st.voice, 100, 70000) / 100 : 1);
     try { n.sat.curve = curveFor(c.drive); } catch (e) {}
     setP(n.limiter.threshold, c.limit);
-    var wet = (st.on && st.eon) ? Math.min(1.2, (st.echo / 100) * 0.05) : 0;
-    var fb = (st.on && st.eon && st.echo > 0) ? Math.min(0.55, 0.15 + st.echo / 10000) : 0;
-    setP(n.wet.gain, wet); setP(n.fb.gain, fb);
+
+    var t = clamp(st.echoTime, 100, 600) / 1000;
+    setP(n.delay.delayTime, t);
+    setP(n.delay2.delayTime, Math.min(0.98, t * 1.6));
+    var eOn = st.on && st.eon;
+    var wet = eOn ? Math.min(1.2, (st.echo / 100) * 0.05) : 0;
+    var fb = (eOn && st.echo > 0) ? Math.min(0.6, 0.18 + st.echo / 9000) : 0;
+    setP(n.wet.gain, wet);
+    setP(n.wet2.gain, wet * 0.6);
+    setP(n.fb.gain, fb);
     p.c = c;
   }
   function apply() {
@@ -116,8 +124,8 @@
   } catch (e) {}
 
   // ---------- the sound pipeline ----------
-  // raw -> hp -> bass -> presence -> treble -> comp1 -> comp2 -> loudness -> VOICE gain
-  //     -> saturator -> sustain -> (echo) -> limiter -> noise gate -> meter -> out
+  // raw -> hp -> bass shelf -> sub-bass -> presence -> treble -> comp1 -> comp2 -> loudness
+  //     -> VOICE gain -> saturator -> sustain -> (echo x2) -> limiter -> noise gate -> out
   function build(track) {
     var ctx = newCtx(); ctx.resume();
     var src = ctx.createMediaStreamSource(new MediaStream([track]));
@@ -126,8 +134,9 @@
     src.connect(gateMeter);
     var gbuf = new Float32Array(1024);
 
-    var hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 75; hp.Q.value = 0.7;
-    var low = ctx.createBiquadFilter(); low.type = 'lowshelf'; low.frequency.value = 200;
+    var hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 50; hp.Q.value = 0.7;
+    var low = ctx.createBiquadFilter(); low.type = 'lowshelf'; low.frequency.value = 220;
+    var sub = ctx.createBiquadFilter(); sub.type = 'peaking'; sub.frequency.value = 90; sub.Q.value = 1;
     var pres = ctx.createBiquadFilter(); pres.type = 'peaking'; pres.frequency.value = 3200; pres.Q.value = 1.5;
     var high = ctx.createBiquadFilter(); high.type = 'highshelf'; high.frequency.value = 6000;
     var comp1 = ctx.createDynamicsCompressor();
@@ -139,8 +148,15 @@
     var sat = ctx.createWaveShaper(); sat.oversample = '4x';
     var sustain = ctx.createGain(); sustain.gain.value = 1;
     var mix = ctx.createGain();
-    var delay = ctx.createDelay(1.0); delay.delayTime.value = 0.28;
+
+    // echo 1: feedback loop through a low-pass so every repeat gets deeper/warmer
+    var delay = ctx.createDelay(1.0); delay.delayTime.value = 0.3;
+    var lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2800;
     var fb = ctx.createGain(), wet = ctx.createGain();
+    // echo 2: a later, separate tap
+    var delay2 = ctx.createDelay(1.0); delay2.delayTime.value = 0.48;
+    var wet2 = ctx.createGain();
+
     var limiter = ctx.createDynamicsCompressor();
     limiter.knee.value = 0; limiter.ratio.value = 20;
     limiter.attack.value = 0.0001; limiter.release.value = 0.01;
@@ -148,17 +164,18 @@
     var meter = ctx.createAnalyser(); meter.fftSize = 1024; meter.smoothingTimeConstant = 0.18;
     var dest = ctx.createMediaStreamDestination();
 
-    src.connect(hp); hp.connect(low); low.connect(pres); pres.connect(high);
+    src.connect(hp); hp.connect(low); low.connect(sub); sub.connect(pres); pres.connect(high);
     high.connect(comp1); comp1.connect(comp2); comp2.connect(loud); loud.connect(gain);
     gain.connect(sat); sat.connect(sustain);
     sustain.connect(mix);
-    sustain.connect(delay); delay.connect(wet); wet.connect(mix);
-    delay.connect(fb); fb.connect(delay);
+    sustain.connect(delay); delay.connect(lp); lp.connect(wet); wet.connect(mix);
+    lp.connect(fb); fb.connect(delay);
+    sustain.connect(delay2); delay2.connect(wet2); wet2.connect(mix);
     mix.connect(limiter); limiter.connect(meter);
     limiter.connect(gate); gate.connect(dest);
 
-    var pipe = { ctx: ctx, nodes: { low: low, pres: pres, high: high, comp1: comp1, loud: loud, gain: gain,
-                 sat: sat, limiter: limiter, wet: wet, fb: fb }, c: params() };
+    var pipe = { ctx: ctx, nodes: { low: low, sub: sub, pres: pres, high: high, comp1: comp1, loud: loud, gain: gain,
+                 sat: sat, limiter: limiter, wet: wet, wet2: wet2, fb: fb, delay: delay, delay2: delay2 }, c: params() };
     pipes.push(pipe);
     applyOne(pipe);
 
@@ -172,10 +189,11 @@
         for (var i = 0; i < gbuf.length; i++) s += gbuf[i] * gbuf[i];
         var rms = Math.sqrt(s / gbuf.length);
         var now = Date.now();
-        if (rms > st.cut / 1000) hold = now + 350;
+        var echoOn = st.eon && st.echo > 0;
+        if (rms > st.cut / 1000) hold = now + (echoOn ? 500 : 350);
         var talking = now < hold;
         gate.gain.setTargetAtTime(talking ? 1 : 0, ctx.currentTime,
-          talking ? 0.008 : (st.eon && st.echo > 0 ? 0.35 : 0.12));
+          talking ? 0.008 : (echoOn ? 0.6 : 0.12));
         var f = talking ? 1 : 0;
         if (status.talk !== f) { status.talk = f; apply(); }
       } catch (e) {}
@@ -207,8 +225,7 @@
       try { ctx.close(); } catch (e) {}
     }, { once: true });
 
-    var out = dest.stream.getAudioTracks()[0];
-    return out;
+    return dest.stream.getAudioTracks()[0];
   }
 
   function processTrack(track, force) {
@@ -356,17 +373,17 @@
     css.textContent =
       '#dx-panel{position:fixed;right:6px;top:50%;transform:translateY(-50%);width:170px;z-index:2147483647;' +
       'background:linear-gradient(180deg,#14142b,#0a0a1a);border:2px solid #2979ff;border-radius:18px;' +
-      'padding:8px 10px;display:flex;flex-direction:column;gap:6px;font-family:sans-serif;' +
+      'padding:8px 10px;display:flex;flex-direction:column;gap:4px;font-family:sans-serif;' +
       'animation:dxg 1.4s infinite alternate;color:#fff;user-select:none}' +
       '@keyframes dxg{from{box-shadow:0 0 14px #ff1744,0 0 4px #ff1744}to{box-shadow:0 0 18px #2979ff,0 0 6px #2979ff}}' +
       '#dx-panel .t{font-weight:800;font-size:13px;letter-spacing:2px;text-align:center;' +
       'background:linear-gradient(90deg,#ff1744,#2979ff);-webkit-background-clip:text;color:transparent}' +
-      '#dx-panel .row{display:flex;flex-direction:column;gap:2px}' +
+      '#dx-panel .row{display:flex;flex-direction:column;gap:0}' +
       '#dx-panel .lb{display:flex;justify-content:space-between;font-size:11px;font-weight:700;color:#82b1ff}' +
       '#dx-panel .lb b{color:#fff}' +
-      '#dx-panel input[type=range]{width:100%;height:26px;accent-color:#ff1744;margin:0}' +
+      '#dx-panel input[type=range]{width:100%;height:22px;accent-color:#ff1744;margin:0}' +
       '#dx-panel .btns{display:flex;gap:4px}' +
-      '#dx-panel button{flex:1;height:30px;border:0;border-radius:10px;font-size:11px;font-weight:800;color:#fff;' +
+      '#dx-panel button{flex:1;height:28px;border:0;border-radius:10px;font-size:11px;font-weight:800;color:#fff;' +
       'background:linear-gradient(135deg,#ff1744,#2979ff)}' +
       '#dx-panel button:active{transform:scale(.93)}' +
       '#dx-st{font-size:10px;color:#82b1ff;text-align:center}' +
@@ -381,8 +398,12 @@
       '<div class="t">DX MASTER</div>' +
       '<div class="row"><div class="lb"><span>VOICE</span><b id="dx-vv"></b></div>' +
       '<input id="dx-v" type="range" min="0" max="100" step="1"></div>' +
+      '<div class="row"><div class="lb"><span>BASS</span><b id="dx-bv"></b></div>' +
+      '<input id="dx-b" type="range" min="0" max="30" step="1"></div>' +
       '<div class="row"><div class="lb"><span>ECHO</span><b id="dx-ev"></b></div>' +
       '<input id="dx-e" type="range" min="0" max="4000" step="100"></div>' +
+      '<div class="row"><div class="lb"><span>ECHO TIME</span><b id="dx-tv"></b></div>' +
+      '<input id="dx-t" type="range" min="100" max="600" step="20"></div>' +
       '<div class="row"><div class="lb"><span>NOISE CUT</span><b id="dx-cv"></b></div>' +
       '<input id="dx-c" type="range" min="1" max="40" step="1"></div>' +
       '<div class="btns"><button id="dx-on"></button><button id="dx-bass">BASS</button><button id="dx-eon">ECHO</button></div>' +
@@ -400,7 +421,9 @@
     function voiceFromPos(pos) { return Math.round(100 * Math.pow(700, pos / 100) / 100) * 100; }
     function ui() {
       $('dx-v').value = posFromVoice(st.voice); $('dx-vv').textContent = st.voice + '%';
+      $('dx-b').value = st.bassDb; $('dx-bv').textContent = st.bassDb + 'dB';
       $('dx-e').value = st.echo; $('dx-ev').textContent = st.echo + '%';
+      $('dx-t').value = st.echoTime; $('dx-tv').textContent = st.echoTime + 'ms';
       $('dx-c').value = st.cut; $('dx-cv').textContent = st.cut;
       $('dx-on').textContent = st.on ? 'ON' : 'OFF';
       $('dx-on').style.opacity = st.on ? '1' : '.45';
@@ -410,7 +433,9 @@
       apply();
     }
     $('dx-v').oninput = function () { st.voice = clamp(voiceFromPos(parseInt(this.value, 10)), 100, 70000); ui(); };
+    $('dx-b').oninput = function () { st.bassDb = parseInt(this.value, 10); ui(); };
     $('dx-e').oninput = function () { st.echo = parseInt(this.value, 10); ui(); };
+    $('dx-t').oninput = function () { st.echoTime = parseInt(this.value, 10); ui(); };
     $('dx-c').oninput = function () { st.cut = parseInt(this.value, 10); ui(); };
     $('dx-on').onclick = function () { st.on = !st.on; ui(); };
     $('dx-bass').onclick = function () { st.bass = !st.bass; ui(); };
